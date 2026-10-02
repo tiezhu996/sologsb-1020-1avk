@@ -2,11 +2,16 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup, ScanIssue, TrustedSource } from './types';
+import { computeMatches, fieldValue } from './utils/matching';
+import {
+  combineScanRefs, emptyScanHandoff, parseScanPacket, planResolveIssue, planScanIngest,
+  recordsHoldingScan, refreshFlags, scanIssueKindLabel, scanIssueStatusLabel
+} from './utils/scanHandoff';
+import { sampleRescanPacket, sampleScanPacket } from './data/samplePackets';
 import { seedState } from './data/seed';
 
-const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
+const STORAGE_KEY = 'sologsb-1020-archive-state-v2';
 const fieldLabels: Array<[FieldKey, string]> = [
   ['title', '标题'], ['date', '日期'], ['people', '人物'], ['places', '地点'], ['identifier', '编号'],
   ['medium', '载体'], ['extent', '数量'], ['rights', '权利'], ['notes', '备注']
@@ -25,6 +30,21 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
 };
 
+const shortFp = (fingerprint: string) => fingerprint.length > 22 ? `${fingerprint.slice(0, 19)}…` : fingerprint;
+const scanFlagLabel: Record<'ok' | 'awaiting-rescan' | 'unresolved', string> = {
+  ok: '已对账', 'awaiting-rescan': '待补扫描', unresolved: '待处理'
+};
+
+/** 待处理单关联到的当前记录标题（合并后用合并记录；无主扫描件提示档案室登记） */
+const issueTargetTitle = (state: ArchiveState, issue: ScanIssue): string => {
+  const current = issue.affectedRecordIds.map((id) => recordById(state, id)).find(Boolean);
+  if (current) return current.title;
+  const merge = state.merges.find((item) => issue.affectedMergeIds.includes(item.id));
+  if (merge) return recordById(state, merge.mergedRecordId ?? '')?.title ?? `${merge.leftId} ↔ ${merge.rightId}`;
+  const baseline = state.scanHandoff.register.find((item) => item.scanId === issue.scanId);
+  return baseline?.title ?? '档案室无此编号登记';
+};
+
 export default component$(() => {
   const state = useStore<ArchiveState>(seedState());
   const history = useSignal<string[]>([]);
@@ -41,13 +61,21 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const scanOpen = useSignal(false);
+  const scanRaw = useSignal('');
+  const scanFileName = useSignal('');
+  const renameOpen = useSignal(false);
+  const renameRecordId = useSignal('');
+  const renameValue = useSignal('');
+  const renameReason = useSignal('');
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
     records: state.records,
     matches: state.matches,
     merges: state.merges,
-    audit: state.audit
+    audit: state.audit,
+    scanHandoff: state.scanHandoff
   });
 
   const capture = () => {
@@ -62,6 +90,7 @@ export default component$(() => {
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
+    state.scanHandoff = next.scanHandoff ?? state.scanHandoff ?? emptyScanHandoff();
   };
 
   const notify = (message: string) => {
@@ -107,6 +136,12 @@ export default component$(() => {
   const visibleMatches = useComputed$(() => filteredMatches.value.slice(0, 120));
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
+
+  const pendingIssues = useComputed$(() =>
+    [...state.scanHandoff.issues]
+      .sort((a, b) => Number(a.status === 'pending') - Number(b.status === 'pending') || b.createdAt.localeCompare(a.createdAt))
+  );
+  const pendingIssueCount = useComputed$(() => state.scanHandoff.issues.filter((issue) => issue.status === 'pending').length);
 
   const updateMatch = $((id: string, status: MatchCandidate['status']) => {
     capture();
@@ -174,6 +209,7 @@ export default component$(() => {
       ...values,
       people: values.people?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.people,
       places: values.places?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.places,
+      scanRefs: combineScanRefs(left, right),
       status: 'merged',
       updatedAt: new Date().toISOString()
     };
@@ -189,7 +225,9 @@ export default component$(() => {
       rightId: right.id,
       chosen: { ...choices },
       values,
-      mergedAt: new Date().toISOString()
+      mergedAt: new Date().toISOString(),
+      mergedRecordId: merged.id,
+      scanRefs: combineScanRefs(left, right)
     });
     commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
     mergeOpen.value = false;
@@ -259,13 +297,149 @@ export default component$(() => {
   });
 
   const exportAudit = $(() => {
-    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({
+      exportedAt: new Date().toISOString(),
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit,
+      scanHandoff: state.scanHandoff
+    }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = `档案元数据核对结果-${new Date().toISOString().slice(0, 10)}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  });
+
+  const importScanFile = $(async (_event: Event, element: HTMLInputElement) => {
+    const file = element.files?.[0];
+    if (!file) return;
+    scanRaw.value = await file.text();
+    scanFileName.value = file.name;
+  });
+
+  /** 移交对账：扫描件只按稳定编号挂回；页数/指纹不一致先进待处理区，缺件保留原结论标记待补 */
+  const parseScanImport = $(() => {
+    const raw = scanRaw.value.trim();
+    if (!raw) return;
+    let packet;
+    try {
+      packet = parseScanPacket(raw);
+    } catch {
+      notify('回传包格式不正确，请使用含编号、页数、指纹的 JSON 或分隔文本');
+      return;
+    }
+    if (!packet.entries.length) {
+      notify('回传包中没有可读取的扫描件条目');
+      return;
+    }
+    capture();
+    const receivedAt = new Date().toISOString();
+    const fallbackBatchId = `BATCH-${receivedAt.slice(0, 10).replace(/-/g, '')}-${state.scanHandoff.batches.length + 1}`;
+    const plan = planScanIngest(
+      state.scanHandoff, packet, state.records, state.matches, state.merges, receivedAt, fallbackBatchId
+    );
+
+    if (plan.reused) {
+      commit('扫描批次重复导入', `批次 ${plan.batch.batchId} 已处理过，沿用已有处理结果，未重复立单`, []);
+      scanRaw.value = '';
+      scanFileName.value = '';
+      scanOpen.value = false;
+      notify(`批次 ${plan.batch.batchId} 已存在，沿用原有对账结果`);
+      return;
+    }
+
+    state.scanHandoff = plan.handoff;
+    state.records = plan.records;
+    state.merges = plan.merges;
+    state.records = refreshFlags(state);
+
+    const pending = plan.handoff.issues.filter((issue) => issue.status === 'pending' && issue.batchId === plan.batch.batchId);
+    const kindCounts = pending.reduce<Record<string, number>>((acc, issue) => {
+      acc[issue.kind] = (acc[issue.kind] ?? 0) + 1;
+      return acc;
+    }, {});
+    const summary = [
+      plan.matched ? `${plan.matched} 件按稳定编号挂回` : '',
+      kindCounts.pages ? `${kindCounts.pages} 件页数不一致` : '',
+      kindCounts.fingerprint ? `${kindCounts.fingerprint} 件指纹不一致` : '',
+      kindCounts.missing ? `${kindCounts.missing} 件回传缺件、保留原结论待补` : '',
+      kindCounts.unmatched ? `${kindCounts.unmatched} 件无主扫描件` : '',
+      plan.batch.autoResolved ? `${plan.batch.autoResolved} 件补传到件自动闭环` : '',
+      plan.batch.reusedDecisions ? `${plan.batch.reusedDecisions} 项冲突沿用既有处理结果` : ''
+    ].filter(Boolean).join('，');
+    commit('扫描回传对账', `批次 ${plan.batch.batchId}：${summary}`, pending.flatMap((issue) => issue.affectedRecordIds));
+    scanRaw.value = '';
+    scanFileName.value = '';
+    scanOpen.value = false;
+    notify(`批次 ${plan.batch.batchId} 对账完成，${pending.length} 项进入待处理区`);
+  });
+
+  /** 处理人选定可信来源：原确认、字段选择、审计、导出包随该提交一并更新 */
+  const resolveScanIssue = $((issueId: string, trusted: TrustedSource) => {
+    const issue = state.scanHandoff.issues.find((item) => item.id === issueId);
+    if (!issue || issue.status !== 'pending') return;
+    const plan = planResolveIssue(
+      state.scanHandoff, state.records, state.merges, issueId, trusted, new Date().toISOString()
+    );
+    if (!plan) return;
+    capture();
+    state.scanHandoff = plan.handoff;
+    state.records = plan.records;
+    state.merges = plan.merges;
+    state.records = refreshFlags(state);
+    const label = scanIssueKindLabel[issue.kind];
+    const detail = trusted === 'scan'
+      ? `${label}（${issue.scanId}）：采用扫描组回传值，页数/指纹已同步，确认结论与字段选择不变`
+      : `${label}（${issue.scanId}）：维持本机原结论，回传值仅留痕不改写`;
+    commit(trusted === 'scan' ? '采信扫描组来源' : '维持本机可信来源', detail, issue.affectedRecordIds);
+    notify(trusted === 'scan' ? '已按扫描组回传更新，结论与选择保持不变' : '已保留本机原结论并闭环');
+  });
+
+  /** 无主扫描件：档案室确认无登记，退回扫描组（不影响任何记录） */
+  const rejectUnmatched = $((issueId: string) => {
+    const issue = state.scanHandoff.issues.find((item) => item.id === issueId);
+    if (!issue || issue.status !== 'pending') return;
+    capture();
+    state.scanHandoff = {
+      ...state.scanHandoff,
+      issues: state.scanHandoff.issues.map((item) =>
+        item.id === issueId
+          ? { ...item, status: 'trusted-local', trustedSource: 'local', resolvedAt: new Date().toISOString(), note: '档案室无此稳定编号登记，退回扫描组核对' }
+          : item
+      )
+    };
+    commit('退回无主扫描件', `扫描件 ${issue.scanId} 在档案室无登记，已退回扫描组`, []);
+    notify('该扫描件已标记退回扫描组');
+  });
+
+  const openRename = $((recordId: string) => {
+    const record = recordById(state, recordId);
+    if (!record) return;
+    renameRecordId.value = recordId;
+    renameValue.value = record.identifier;
+    renameReason.value = '';
+    renameOpen.value = true;
+  });
+
+  /** 本机编号修改：记入轨迹与审计；扫描件仍按稳定编号挂回，不会错配 */
+  const submitRename = $(() => {
+    const record = recordById(state, renameRecordId.value);
+    if (!record) return;
+    const next = renameValue.value.trim();
+    if (!next || next === record.identifier) { renameOpen.value = false; return; }
+    capture();
+    const at = new Date().toISOString();
+    record.identifierHistory = [...(record.identifierHistory ?? []), { from: record.identifier, to: next, at, reason: renameReason.value.trim() || undefined }];
+    if (!record.sentIdentifier) record.sentIdentifier = record.identifier;
+    const before = record.identifier;
+    record.identifier = next;
+    record.updatedAt = at;
+    commit('修改本机编号', `编号由 ${before} 改为 ${next}；扫描件按稳定编号挂回，不影响对账`, [record.id]);
+    renameOpen.value = false;
+    notify('本机编号已修改，扫描件仍按稳定编号挂回');
   });
 
   const moveReview = $((delta: number) => {
@@ -284,6 +458,13 @@ export default component$(() => {
       if (raw) {
         const saved = JSON.parse(raw) as Partial<ArchiveState>;
         restore(JSON.stringify(saved));
+      } else {
+        // 兼容旧版工作区：缺失移交台账时补空结构，不覆盖已有的确认结论与字段选择
+        const legacy = localStorage.getItem('sologsb-1020-archive-state-v1');
+        if (legacy) {
+          const saved = JSON.parse(legacy) as Partial<ArchiveState>;
+          restore(JSON.stringify({ ...saved, scanHandoff: saved.scanHandoff ?? emptyScanHandoff() }));
+        }
       }
     } catch {
       localStorage.removeItem(STORAGE_KEY);
@@ -292,7 +473,14 @@ export default component$(() => {
   });
 
   useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
+    const payload = track(() => JSON.stringify({
+      revision: state.revision,
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit,
+      scanHandoff: state.scanHandoff
+    }));
     if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
   });
 
@@ -332,6 +520,10 @@ export default component$(() => {
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="button ghost" onClick$={() => importOpen.value = true}>导入两组记录</button>
+          <button class="button light scan-import-button" onClick$={() => scanOpen.value = true}>
+            扫描回传对账
+            {pendingIssueCount.value > 0 && <span class="scan-badge">{pendingIssueCount.value}</span>}
+          </button>
           <button class="button light" onClick$={exportAudit}>导出核对包</button>
         </div>
       </header>
@@ -342,6 +534,7 @@ export default component$(() => {
           <div><strong>{state.records.filter((record) => record.group === 'A').length}</strong><span>A 组记录</span></div>
           <div><strong>{state.records.filter((record) => record.group === 'B').length}</strong><span>B 组记录</span></div>
           <div><strong>{state.matches.filter((match) => match.status === 'suggested').length}</strong><span>待复核匹配</span></div>
+          <div class="danger"><strong>{pendingIssueCount.value}</strong><span>扫描待处理</span></div>
           <div class="danger"><strong>{conflictCount.value}</strong><span>低分可疑项</span></div>
         </div>
       </div>
@@ -412,13 +605,18 @@ export default component$(() => {
             </select>
           </div>
           <div class="record-table">
-            <div class="table-head"><span>来源</span><span>标题</span><span>日期 / 人物 / 地点</span><span>编号</span><span>状态</span></div>
+            <div class="table-head"><span>来源</span><span>标题</span><span>日期 / 人物 / 地点</span><span>本机编号 / 扫描件</span><span>状态</span></div>
             {filteredRecords.value.map((record) => (
               <div class="table-row" key={record.id}>
                 <span class={`group-badge ${record.group.toLowerCase()}`}>{record.group}</span>
                 <strong>{record.title}</strong>
                 <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
-                <code>{record.identifier}</code>
+                <span class="id-cell">
+                  <span class="id-line"><code>{record.identifier}</code><button class="rename-mini" title="修改本机编号（扫描件仍按稳定编号挂回）" onClick$={() => openRename(record.id)}>改</button></span>
+                  {record.sentIdentifier && record.sentIdentifier !== record.identifier && <small class="sent-id">送出时：{record.sentIdentifier}</small>}
+                  {record.scanRefs?.map((ref) => <small class="scan-id-line" key={ref.scanId}>{ref.scanId}{ref.pages !== null ? ` · ${ref.pages}页` : ''}</small>)}
+                  {record.scanFlag && record.scanFlag !== 'ok' && <em class={`scan-flag ${record.scanFlag === 'awaiting-rescan' ? 'missing' : 'unresolved'}`}>{scanFlagLabel[record.scanFlag]}</em>}
+                </span>
                 <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
               </div>
             ))}
@@ -431,8 +629,13 @@ export default component$(() => {
             <Tabs.List class="tab-list"><Tabs.Tab>复核详情</Tabs.Tab><Tabs.Tab>合并追溯</Tabs.Tab><Tabs.Tab>键盘帮助</Tabs.Tab></Tabs.List>
             <Tabs.Panel class="tab-panel">
               {activeMatch.value ? (() => {
-                const left = recordById(state, activeMatch.value!.leftId)!;
-                const right = recordById(state, activeMatch.value!.rightId)!;
+                const left = recordById(state, activeMatch.value!.leftId);
+                const right = recordById(state, activeMatch.value!.rightId);
+                if (!left || !right) {
+                  const merge = state.merges.find((item) => item.matchId === activeMatch.value!.id);
+                  const merged = merge ? recordById(state, merge.mergedRecordId ?? '') : undefined;
+                  return <div class="empty-state">两条记录已合并为「{merged?.title ?? '合并记录'}」，字段来源选择见“合并追溯”页签。</div>;
+                }
                 return <>
                   <div class="active-score"><span>{Math.round(activeMatch.value!.score * 100)}</span><div><strong>综合匹配分</strong><small>{activeMatch.value!.reasons.join(' · ')}</small></div></div>
                   <div class="field-compare compact"><div class="field-label">字段</div><div>A 来源</div><div>B 来源</div>
@@ -446,7 +649,7 @@ export default component$(() => {
               {state.merges.length ? state.merges.map((merge) => {
                 const left = recordById(state, merge.leftId);
                 const right = recordById(state, merge.rightId);
-                return <details class="merge-log" key={merge.id}><summary>{left?.title ?? merge.leftId} ↔ {right?.title ?? merge.rightId}</summary><p>{new Date(merge.mergedAt).toLocaleString('zh-CN')}</p><ul>{Object.entries(merge.chosen).map(([field, choice]) => <li key={field}><strong>{fieldLabels.find(([key]) => key === field)?.[1]}</strong><span>保留 {choice === 'A' ? 'A 来源' : choice === 'B' ? 'B 来源' : '双来源拼接'}：{merge.values[field as FieldKey]}</span></li>)}</ul></details>;
+                return <details class="merge-log" key={merge.id}><summary>{left?.title ?? merge.leftId} ↔ {right?.title ?? merge.rightId}</summary><p>{new Date(merge.mergedAt).toLocaleString('zh-CN')}</p>{merge.scanRefs?.length ? <p class="merge-scans">挂接扫描件：{merge.scanRefs.map((ref) => ref.scanId).join('、')}</p> : null}<ul>{Object.entries(merge.chosen).map(([field, choice]) => <li key={field}><strong>{fieldLabels.find(([key]) => key === field)?.[1]}</strong><span>保留 {choice === 'A' ? 'A 来源' : choice === 'B' ? 'B 来源' : '双来源拼接'}：{merge.values[field as FieldKey]}</span></li>)}</ul></details>;
               }) : <div class="empty-state">还没有合并记录。完成一次字段合并后，来源选择会出现在这里。</div>}
             </Tabs.Panel>
             <Tabs.Panel class="tab-panel shortcut-panel">
@@ -455,6 +658,109 @@ export default component$(() => {
           </Tabs.Root>
         </section>
       </main>
+
+      <section class="handoff-wrap">
+        <div class="handoff-heading">
+          <div><span class="eyebrow">04 / SCAN HANDOFF</span><h3>扫描组移交对账</h3></div>
+          <div class="handoff-actions">
+            <span class="shortcut-hint">回传包仅含稳定编号、页数与指纹 · 结论按核对台保存</span>
+            <button class="button small ghost" onClick$={() => { scanRaw.value = sampleScanPacket; scanFileName.value = '示例：BATCH-2026-09-30-01'; }}>载入示例回传包</button>
+            <button class="button small ghost" onClick$={() => { scanRaw.value = sampleRescanPacket; scanFileName.value = '示例：缺件补传'; }}>载入缺件补传包</button>
+            <button class="button small primary" onClick$={() => scanOpen.value = true}>导入回传包</button>
+          </div>
+        </div>
+
+        <div class="handoff-grid">
+          <article class="panel issue-panel">
+            <div class="panel-heading">
+              <div><span class="eyebrow">PENDING QUEUE</span><h3>待处理区</h3></div>
+              <span>{pendingIssueCount.value} 项未闭环</span>
+            </div>
+            <div class="issue-list">
+              {pendingIssues.value.map((issue) => {
+                const currentRecords = recordsHoldingScan(state.records, issue.scanId);
+                const affectedMerges = state.merges.filter((merge) => issue.affectedMergeIds.includes(merge.id));
+                const isPending = issue.status === 'pending';
+                return (
+                  <div class={`issue-card kind-${issue.kind} ${isPending ? '' : 'closed'}`} key={issue.id}>
+                    <div class="issue-topline">
+                      <span class={`issue-kind ${issue.kind}`}>{scanIssueKindLabel[issue.kind]}</span>
+                      <code class="issue-scanid">{issue.scanId}</code>
+                      <span class={`issue-status ${isPending ? 'pending' : 'done'}`}>{scanIssueStatusLabel[issue.status]}</span>
+                    </div>
+                    <div class="issue-target">挂回记录：{issueTargetTitle(state, issue)}</div>
+                    <div class="issue-diff">
+                      {issue.kind === 'pages' && <><span>本机页数 <b>{issue.localPages ?? '—'}</b></span><i>→</i><span>回传页数 <b>{issue.receivedPages ?? '—'}</b></span></>}
+                    </div>
+                    <div class="issue-diff">
+                      {issue.kind === 'fingerprint' && <><span class="fp-cell">本机指纹 <b>{shortFp(issue.localFingerprint ?? '')}</b></span><i>≠</i><span class="fp-cell">回传指纹 <b>{shortFp(issue.receivedFingerprint ?? '')}</b></span></>}
+                      {issue.kind === 'missing' && <span>本批未回传该扫描件，原确认与字段选择保留，标记待补扫描</span>}
+                      {issue.kind === 'unmatched' && <span>回传编号在档案室无登记，页数 {issue.receivedPages ?? '—'}，指纹 {shortFp(issue.receivedFingerprint ?? '')}</span>}
+                    </div>
+                    {(affectedMerges.length > 0 || issue.matchScore !== null) && (
+                      <div class="issue-impact">
+                        {affectedMerges.length > 0 && <span class="impact-merge">受影响合并记录：{affectedMerges.map((merge) => recordById(state, merge.mergedRecordId ?? '')?.title ?? `${merge.leftId}↔${merge.rightId}`).join('、')}</span>}
+                        {issue.matchScore !== null && <span class="impact-score">相关匹配分 <b>{Math.round(issue.matchScore * 100)}%</b></span>}
+                      </div>
+                    )}
+                    {currentRecords.length === 0 && !affectedMerges.length && issue.kind !== 'unmatched' && <div class="issue-impact"><span>原记录已合并，扫描件挂在合并记录上</span></div>}
+                    <div class="issue-meta">批次 {issue.batchId} · {new Date(issue.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}{issue.resolvedAt ? ` · ${new Date(issue.resolvedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} 闭环` : ''}</div>
+                    {isPending && (
+                      <div class="issue-actions">
+                        {issue.kind === 'unmatched'
+                          ? <button class="button small ghost" onClick$={() => rejectUnmatched(issue.id)}>登记无此件，退回扫描组</button>
+                          : <>
+                              <button class="button small confirm" title="以扫描组回传的页数/指纹更新，确认与字段选择不变" onClick$={() => resolveScanIssue(issue.id, 'scan')}>采信扫描组</button>
+                              {issue.kind !== 'missing' && <button class="button small ghost" title="维持本机保存的结论，回传值仅留痕" onClick$={() => resolveScanIssue(issue.id, 'local')}>维持本机</button>}
+                              {issue.kind === 'missing' && <button class="button small" disabled title="等待扫描组补传，补传到件后自动闭环">等待补传</button>}
+                            </>}
+                      </div>
+                    )}
+                    {issue.note && <div class="issue-note">{issue.note}</div>}
+                  </div>
+                );
+              })}
+              {!pendingIssues.value.length && <div class="empty-state">暂无扫描待处理项。导入回传包后，页数或指纹不一致、缺件和无主扫描件会进入这里。</div>}
+            </div>
+          </article>
+
+          <article class="panel ledger-panel">
+            <div class="panel-heading">
+              <div><span class="eyebrow">HANDOFF LEDGER</span><h3>移交台账与批次</h3></div>
+              <span>登记 {state.scanHandoff.register.length} 件 · 批次 {state.scanHandoff.batches.length}</span>
+            </div>
+            <div class="ledger-list">
+              <div class="ledger-section-title">扫描件基线（按稳定编号挂回，编号改过也不错配）</div>
+              {state.scanHandoff.register.map((baseline) => {
+                const holder = recordsHoldingScan(state.records, baseline.scanId)[0];
+                const holderMerge = state.merges.find((merge) => merge.scanRefs?.some((ref) => ref.scanId === baseline.scanId));
+                const holderTitle = holder?.title
+                  ?? (holderMerge ? recordById(state, holderMerge.mergedRecordId ?? '')?.title : undefined)
+                  ?? baseline.title;
+                const issue = state.scanHandoff.issues.find((item) => item.scanId === baseline.scanId && item.status === 'pending');
+                return (
+                  <div class={`ledger-row ${issue ? 'has-issue' : ''}`} key={baseline.scanId}>
+                    <code>{baseline.scanId}</code>
+                    <span class="ledger-title">{holderTitle}</span>
+                    <small>{baseline.sentIdentifier} · {baseline.pages ?? '—'}页 · {shortFp(baseline.fingerprint)}</small>
+                    {issue && <em class={`ledger-flag ${issue.kind === 'missing' ? 'missing' : 'unresolved'}`}>{scanIssueKindLabel[issue.kind]}</em>}
+                    {!issue && <em class="ledger-flag ok">已对账</em>}
+                  </div>
+                );
+              })}
+              <div class="ledger-section-title">已收批次</div>
+              {state.scanHandoff.batches.map((batch) => (
+                <div class="ledger-row batch" key={batch.batchId}>
+                  <code>{batch.batchId}</code>
+                  <span class="ledger-title">{batch.entryCount} 件回传{batch.reused ? ' · 重复导入沿用原结果' : ''}</span>
+                  <small>{new Date(batch.receivedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} · {batch.type === 'full' ? '全量' : '补传'} · 立单 {batch.issuesRaised} · 自动闭环 {batch.autoResolved}{batch.reusedDecisions ? ` · 沿用决策 ${batch.reusedDecisions}` : ''}</small>
+                </div>
+              ))}
+              {!state.scanHandoff.batches.length && <div class="empty-state">还没有收到过回传批次。</div>}
+            </div>
+          </article>
+        </div>
+      </section>
 
       <section class="bottom-grid">
         <article class="panel audit-panel">
@@ -469,6 +775,7 @@ export default component$(() => {
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
           <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
           <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>4</span><p>扫描件按稳定编号挂回，本机编号改动只记轨迹不影响挂接；页数或指纹不一致先进待处理区，处理人选定来源后确认、字段选择、审计和导出包一起更新；缺件保留原结论待补，重复批次沿用原结果。</p></div>
         </article>
       </section>
 
@@ -493,8 +800,9 @@ export default component$(() => {
         <Modal.Panel class="modal-panel merge-modal">
           <Modal.Header class="modal-header"><div><span class="eyebrow">FIELD MERGE</span><Modal.Title>逐字段选择保留来源</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
           {activeMatch.value && (() => {
-            const left = recordById(state, activeMatch.value!.leftId)!;
-            const right = recordById(state, activeMatch.value!.rightId)!;
+            const left = recordById(state, activeMatch.value!.leftId);
+            const right = recordById(state, activeMatch.value!.rightId);
+            if (!left || !right) return <Modal.Description class="modal-description">该匹配的两条记录已合并，请在“合并追溯”中查看。</Modal.Description>;
             return <>
               <Modal.Description class="modal-description">每个字段都显示两条记录的原始来源。选择后，生成一条新合并记录，原记录编号与选择依据仍保留在审计轨迹中。</Modal.Description>
               <div class="field-picker-head"><span>字段</span><span>A 组来源</span><span>B 组来源</span></div>
@@ -509,6 +817,33 @@ export default component$(() => {
               <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" onClick$={mergeCurrent}>生成合并记录</button></Modal.Footer>
             </>;
           })()}
+        </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={scanOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel import-modal">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">SCAN HANDOFF</span><Modal.Title>导入扫描组回传包</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">回传包只含扫描件稳定编号、页数与文件指纹。系统按稳定编号挂回原记录（本机编号改过也不会错配）；页数或指纹不一致时进入待处理区，回传缺少的旧记录保留原结论并标记待补。同一批次重复导入沿用已有处理结果。</Modal.Description>
+          <div class="import-controls">
+            <label class="file-button">选择回传文件<input type="file" accept=".json,.txt,.csv,.tsv" onChange$={(event, element) => importScanFile(event, element)} /></label>
+            <button class="button small ghost" onClick$={() => { scanRaw.value = sampleScanPacket; scanFileName.value = '示例：BATCH-2026-09-30-01'; }}>载入示例回传包</button>
+            <button class="button small ghost" onClick$={() => { scanRaw.value = sampleRescanPacket; scanFileName.value = '示例：缺件补传'; }}>载入缺件补传包</button>
+          </div>
+          <textarea class="modal-textarea" value={scanRaw.value} onInput$={(event) => scanRaw.value = (event.target as HTMLTextAreaElement).value} placeholder={'{\n  "batchId": "BATCH-2026-09-30-01",\n  "entries": [\n    { "scanId": "SCAN-MS-0017", "pages": 18, "fingerprint": "sha256:..." }\n  ]\n}'} />
+          {scanFileName.value && <div class="file-name">已读取：{scanFileName.value}</div>}
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!scanRaw.value.trim()} onClick$={parseScanImport}>移交对账</button></Modal.Footer>
+        </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={renameOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel rename-modal">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">LOCAL IDENTIFIER</span><Modal.Title>修改本机编号</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">只修改本机编号并保留修改轨迹；扫描件仍按稳定编号挂回，移交对账不受影响。</Modal.Description>
+          <div class="rename-fields">
+            <label>新本机编号<input class="input" value={renameValue.value} onInput$={(event) => renameValue.value = (event.target as HTMLInputElement).value} /></label>
+            <label>修改原因（可选）<input class="input" value={renameReason.value} onInput$={(event) => renameReason.value = (event.target as HTMLInputElement).value} placeholder="如：编号规则调整" /></label>
+          </div>
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" onClick$={submitRename}>保存修改</button></Modal.Footer>
         </Modal.Panel>
       </Modal.Root>
     </div>
